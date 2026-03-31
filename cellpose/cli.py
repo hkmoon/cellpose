@@ -30,6 +30,9 @@ def get_arg_parser():
     hardware_args.add_argument(
         "--gpu_device", required=False, default="0", type=str,
         help="which gpu device to use, use an integer for torch, or mps for M1")
+    hardware_args.add_argument(
+        "--use_mlx", action="store_true",
+        help="use MLX backend for Apple Silicon acceleration (requires macOS + Apple Silicon + mlx package)")
     
     # settings for locating and formatting images
     input_img_args = parser.add_argument_group("Input Image Arguments")
