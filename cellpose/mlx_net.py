@@ -44,7 +44,7 @@ class MLPBlock(_BaseModule):
 
 
 class LayerNorm2d(_BaseModule):
-    """Layer normalization for 2D feature maps (N, C, H, W)."""
+    """Layer normalization for 2D feature maps in NHWC layout."""
 
     def __init__(self, num_channels: int, eps: float = 1e-6):
         super().__init__()
@@ -53,11 +53,11 @@ class LayerNorm2d(_BaseModule):
         self.eps = eps
 
     def __call__(self, x):
-        # x: (N, C, H, W)
-        u = mx.mean(x, axis=1, keepdims=True)
-        s = mx.mean((x - u) ** 2, axis=1, keepdims=True)
+        # x: (N, H, W, C) — NHWC layout, normalize over C
+        u = mx.mean(x, axis=-1, keepdims=True)
+        s = mx.mean((x - u) ** 2, axis=-1, keepdims=True)
         x = (x - u) / mx.sqrt(s + self.eps)
-        x = self.weight[None, :, None, None] * x + self.bias[None, :, None, None]
+        x = self.weight * x + self.bias
         return x
 
 
@@ -68,49 +68,87 @@ class Attention(_BaseModule):
                  use_rel_pos: bool = True, input_size: int = 32):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
 
         self.use_rel_pos = use_rel_pos
         if use_rel_pos:
-            self.rel_pos_h = mx.zeros((2 * input_size - 1, head_dim))
-            self.rel_pos_w = mx.zeros((2 * input_size - 1, head_dim))
+            self.rel_pos_h = mx.zeros((2 * input_size - 1, self.head_dim))
+            self.rel_pos_w = mx.zeros((2 * input_size - 1, self.head_dim))
+            # Precomputed index tables (set by _precompute_rel_pos)
+            self._rel_h_idx = None
+            self._rel_w_idx = None
 
     def __call__(self, x):
         B, H, W, _ = x.shape
-        # qkv: (B, H*W, 3, num_heads, head_dim)
-        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1)
-        # transpose to (3, B, num_heads, H*W, head_dim)
-        qkv = qkv.transpose(2, 0, 3, 1, 4)
-        # reshape to (3, B*num_heads, H*W, head_dim)
-        q, k, v = [qkv[i].reshape(B * self.num_heads, H * W, -1) for i in range(3)]
+        num_heads = self.num_heads
+        head_dim = self.head_dim
 
-        attn = (q * self.scale) @ k.transpose(0, 2, 1)
+        # QKV projection: (B, H, W, 3*dim) -> (B, H*W, 3, num_heads, head_dim)
+        qkv = self.qkv(x).reshape(B, H * W, 3, num_heads, head_dim)
+        q = qkv[:, :, 0]  # (B, H*W, num_heads, head_dim)
+        k = qkv[:, :, 1]
+        v = qkv[:, :, 2]
 
         if self.use_rel_pos:
-            attn = _add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w,
-                                           (H, W), (H, W))
+            # Transpose to (B, num_heads, H*W, head_dim) for attention
+            q = q.transpose(0, 2, 1, 3)
+            k = k.transpose(0, 2, 1, 3)
+            v = v.transpose(0, 2, 1, 3)
 
-        attn = mx.softmax(attn, axis=-1)
+            # Scaled dot-product attention
+            attn = (q * self.scale) @ k.transpose(0, 1, 3, 2)  # (B, heads, HW, HW)
 
-        x = (attn @ v).reshape(B, self.num_heads, H, W, -1)
-        x = x.transpose(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+            # Add relative position bias
+            attn = self._add_rel_pos_bias(attn, q, H, W)
+
+            attn = mx.softmax(attn, axis=-1)
+            x = attn @ v  # (B, num_heads, H*W, head_dim)
+            x = x.transpose(0, 2, 1, 3).reshape(B, H, W, -1)
+        else:
+            # Use fused SDPA when no rel_pos needed (no bias term)
+            # q/k/v: (B, H*W, num_heads, head_dim)
+            q = q.transpose(0, 2, 1, 3)
+            k = k.transpose(0, 2, 1, 3)
+            v = v.transpose(0, 2, 1, 3)
+            x = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
+            x = x.transpose(0, 2, 1, 3).reshape(B, H, W, -1)
+
         x = self.proj(x)
         return x
 
+    def _add_rel_pos_bias(self, attn, q, H, W):
+        """Add decomposed relative position bias to attention scores.
+
+        Uses precomputed index tables and einsum for efficiency.
+        """
+        B_heads = attn.shape[0] * attn.shape[1]
+        head_dim = self.head_dim
+
+        # Gather rel_pos embeddings using precomputed indices
+        Rh = self.rel_pos_h[self._rel_h_idx]  # (H, H, head_dim)
+        Rw = self.rel_pos_w[self._rel_w_idx]  # (W, W, head_dim)
+
+        # Reshape q for spatial decomposition: (B, heads, H, W, head_dim)
+        r_q = q.reshape(q.shape[0], q.shape[1], H, W, head_dim)
+
+        # rel_h: einsum "bnhwc,hkc->bnhwk" -> (B, heads, H, W, H)
+        rel_h = mx.einsum("bnhwc,hkc->bnhwk", r_q, Rh)
+        # rel_w: einsum "bnhwc,wkc->bnhwk" -> (B, heads, H, W, W)
+        rel_w = mx.einsum("bnhwc,wkc->bnhwk", r_q, Rw)
+
+        # Add to attention: reshape attn to (B, heads, H, W, H, W)
+        attn = (attn.reshape(q.shape[0], q.shape[1], H, W, H, W)
+                + mx.expand_dims(rel_h, axis=-1)
+                + mx.expand_dims(rel_w, axis=-2))
+        attn = attn.reshape(q.shape[0], q.shape[1], H * W, H * W)
+        return attn
+
 
 def _precompute_rel_pos_for_size(spatial_size, rel_pos):
-    """Interpolate relative position embeddings to match the target spatial size.
-
-    Args:
-        spatial_size: Target spatial dimension (H or W of feature map).
-        rel_pos: Current rel_pos embeddings, shape (L, head_dim).
-
-    Returns:
-        Interpolated rel_pos of shape (2*spatial_size-1, head_dim).
-    """
+    """Interpolate relative position embeddings to match the target spatial size."""
     target_len = 2 * spatial_size - 1
     if rel_pos.shape[0] == target_len:
         return rel_pos
@@ -122,58 +160,16 @@ def _precompute_rel_pos_for_size(spatial_size, rel_pos):
     return mx.array(f(x_new).astype(np.float32))
 
 
-def _get_rel_pos(q_size, k_size, rel_pos):
-    """Get relative positional embeddings according to the relative positions of query and key."""
-    max_rel_dist = int(2 * max(q_size, k_size) - 1)
-    if rel_pos.shape[0] != max_rel_dist:
-        # Interpolate rel pos (equivalent to F.interpolate linear)
-        rel_pos_resized = np.array(rel_pos)
-        from scipy.interpolate import interp1d
-        x_old = np.linspace(0, 1, rel_pos_resized.shape[0])
-        x_new = np.linspace(0, 1, max_rel_dist)
-        f = interp1d(x_old, rel_pos_resized, axis=0, kind='linear')
-        rel_pos_resized = mx.array(f(x_new).astype(np.float32))
-    else:
-        rel_pos_resized = rel_pos
+def _precompute_rel_pos_indices(spatial_size):
+    """Precompute relative position index table for a given spatial size.
 
-    q_coords = np.arange(q_size)[:, None] * max(k_size / q_size, 1.0)
-    k_coords = np.arange(k_size)[None, :] * max(q_size / k_size, 1.0)
-    relative_coords = (q_coords - k_coords) + (k_size - 1) * max(q_size / k_size, 1.0)
-    indices = relative_coords.astype(np.int64)
-
-    return rel_pos_resized[mx.array(indices)]
-
-
-def _add_decomposed_rel_pos(attn, q, rel_pos_h, rel_pos_w, q_size, k_size):
-    """Add decomposed relative positional embeddings to attention.
-
-    Mirrors SAM's add_decomposed_rel_pos exactly:
-        rel_h = einsum("bhwc,hkc->bhwk", r_q, Rh)  -> (B, q_h, q_w, k_h)
-        rel_w = einsum("bhwc,wkc->bhwk", r_q, Rw)  -> (B, q_h, q_w, k_w)
-        attn += rel_h[:,:,:,:,None] + rel_w[:,:,:,None,:]
+    Returns an int32 mx.array of shape (spatial_size, spatial_size) that
+    can be used to gather from the rel_pos embedding.
     """
-    q_h, q_w = q_size
-    k_h, k_w = k_size
-    Rh = _get_rel_pos(q_h, k_h, rel_pos_h)
-    Rw = _get_rel_pos(q_w, k_w, rel_pos_w)
-
-    B, _, dim = q.shape
-    r_q = q.reshape(B, q_h, q_w, dim)
-
-    # einsum "bhwc,hkc->bhwk": contract over c, index h shared
-    # r_q: (B, q_h, q_w, dim), Rh: (q_h, k_h, dim)
-    rel_h = (r_q[:, :, :, None, :] * Rh[None, :, None, :, :]).sum(axis=-1)
-    # einsum "bhwc,wkc->bhwk": contract over c, index w shared
-    # r_q: (B, q_h, q_w, dim), Rw: (q_w, k_w, dim)
-    rel_w = (r_q[:, :, :, None, :] * Rw[None, None, :, :, :]).sum(axis=-1)
-
-    # rel_h: (B, q_h, q_w, k_h) -> unsqueeze last dim for broadcasting over k_w
-    # rel_w: (B, q_h, q_w, k_w) -> unsqueeze at -2 for broadcasting over k_h
-    attn = (attn.reshape(B, q_h, q_w, k_h, k_w)
-            + mx.expand_dims(rel_h, axis=-1)
-            + mx.expand_dims(rel_w, axis=-2))
-    attn = attn.reshape(B, q_h * q_w, k_h * k_w)
-    return attn
+    coords = np.arange(spatial_size)
+    # relative_coords[i,j] = i - j + (spatial_size - 1)
+    relative_coords = coords[:, None] - coords[None, :] + (spatial_size - 1)
+    return mx.array(relative_coords.astype(np.int32))
 
 
 class Block(_BaseModule):
@@ -215,7 +211,7 @@ class PatchEmbed(_BaseModule):
 
 
 class Neck(_BaseModule):
-    """Neck module: two Conv2d + LayerNorm2d layers."""
+    """Neck module: two Conv2d + LayerNorm2d layers, all in NHWC layout."""
 
     def __init__(self, embed_dim: int = 1024, out_chans: int = 256):
         super().__init__()
@@ -225,16 +221,11 @@ class Neck(_BaseModule):
         self.ln2 = LayerNorm2d(out_chans)
 
     def __call__(self, x):
-        # x: (N, C, H, W) channels-first
-        # MLX Conv2d expects (N, H, W, C)
-        x = x.transpose(0, 2, 3, 1)  # (N, H, W, C)
-        x = self.conv1(x)
-        x = x.transpose(0, 3, 1, 2)  # back to (N, C, H, W) for LayerNorm2d
-        x = self.ln1(x)
-        x = x.transpose(0, 2, 3, 1)  # (N, H, W, C) for conv2
-        x = self.conv2(x)
-        x = x.transpose(0, 3, 1, 2)  # (N, C, H, W) for LayerNorm2d
-        x = self.ln2(x)
+        # x: (N, H, W, C) — already NHWC from transformer blocks
+        x = self.conv1(x)   # (N, H, W, out_chans)
+        x = self.ln1(x)     # NHWC LayerNorm over C
+        x = self.conv2(x)   # (N, H, W, out_chans)
+        x = self.ln2(x)     # NHWC LayerNorm over C
         return x
 
 
@@ -294,6 +285,9 @@ class TransformerMLX(_BaseModule):
         self.diam_labels = mx.array([30.0])
         self.diam_mean = mx.array([30.0])
 
+        # Compiled forward function (set after weight loading)
+        self._compiled_forward = None
+
     def __call__(self, x):
         """
         Forward pass.
@@ -306,6 +300,12 @@ class TransformerMLX(_BaseModule):
                 output: (N, nout, H, W) flow predictions
                 style: (N, 256) zeros for backward compatibility
         """
+        if self._compiled_forward is not None:
+            return self._compiled_forward(x)
+        return self._forward(x)
+
+    def _forward(self, x):
+        """Uncompiled forward pass."""
         # Patch embedding: (N, C, H, W) -> (N, H', W', embed_dim)
         x = self.patch_embed(x)
 
@@ -313,18 +313,16 @@ class TransformerMLX(_BaseModule):
         if self.pos_embed is not None:
             x = x + self.pos_embed
 
-        # Transformer blocks
+        # Transformer blocks — x stays in (N, H', W', embed_dim) throughout
         for blk in self.blocks:
             x = blk(x)
 
-        # Neck: (N, H', W', embed_dim) -> permute to (N, embed_dim, H', W') -> neck -> (N, 256, H', W')
-        x = x.transpose(0, 3, 1, 2)  # (N, embed_dim, H', W')
+        # Neck: (N, H', W', embed_dim) -> (N, H', W', 256), all NHWC
         x = self.neck(x)
 
-        # Readout: (N, 256, H', W') -> (N, nout*ps^2, H', W')
-        # MLX Conv2d expects (N, H, W, C)
-        x1 = x.transpose(0, 2, 3, 1)  # (N, H', W', 256)
-        x1 = self.out_conv(x1)  # (N, H', W', nout*ps^2)
+        # Readout: (N, H', W', 256) -> (N, H', W', nout*ps^2)
+        x1 = self.out_conv(x)
+        # Convert to NCHW for pixel shuffle
         x1 = x1.transpose(0, 3, 1, 2)  # (N, nout*ps^2, H', W')
 
         # Transpose convolution equivalent (pixel shuffle)
@@ -370,18 +368,26 @@ class TransformerMLX(_BaseModule):
         mx.eval(self.parameters())
         self._precompute_rel_pos()
 
+        # Compile the forward pass for faster inference
+        self._compiled_forward = mx.compile(self._forward)
+
     def _precompute_rel_pos(self):
-        """Pre-compute interpolated relative position embeddings.
+        """Pre-compute interpolated relative position embeddings and index tables.
 
         The SAM checkpoint stores rel_pos at size (2*64-1, head_dim)=(127, head_dim),
         but cellpose uses spatial size bsize//ps=32, needing (2*32-1)=(63, head_dim).
-        Pre-computing avoids repeated scipy interpolation during inference.
+        Pre-computing avoids repeated scipy interpolation and numpy ops during inference.
         """
         spatial_size = self.bsize // self.ps
+        # Precompute index tables once
+        h_idx = _precompute_rel_pos_indices(spatial_size)
+        w_idx = _precompute_rel_pos_indices(spatial_size)
         for blk in self.blocks:
             if blk.attn.use_rel_pos:
                 blk.attn.rel_pos_h = _precompute_rel_pos_for_size(
                     spatial_size, blk.attn.rel_pos_h)
                 blk.attn.rel_pos_w = _precompute_rel_pos_for_size(
                     spatial_size, blk.attn.rel_pos_w)
+                blk.attn._rel_h_idx = h_idx
+                blk.attn._rel_w_idx = w_idx
         mx.eval(self.parameters())
