@@ -74,6 +74,13 @@ def convert_pytorch_to_mlx_weights(state_dict, model):
 
         _set_nested(weights, mlx_path, mx.array(arr))
 
+    # MLX model.update() expects Python lists for list-based submodules
+    # (e.g., self.blocks = [Block(...), ...]).  _set_nested builds plain
+    # dicts with string keys like {"0": {...}, "1": {...}}.  Convert any
+    # such dict whose keys are consecutive integers starting at 0 into a
+    # list so that update() can match them by index.
+    weights = _dicts_to_lists(weights)
+
     return weights
 
 
@@ -184,6 +191,28 @@ def _set_nested(d, path, value):
             d[key] = {}
         d = d[key]
     d[path[-1]] = value
+
+
+def _dicts_to_lists(obj):
+    """Recursively convert dicts with consecutive-integer string keys to lists.
+
+    MLX's ``Module.update()`` expects Python lists for list-based submodules
+    (e.g. ``self.blocks``).  The weight-building step produces plain dicts
+    with string keys ``{"0": ..., "1": ...}`` which must be converted.
+    """
+    if not isinstance(obj, dict):
+        return obj
+
+    # Recurse first so children are converted before we inspect keys
+    converted = {k: _dicts_to_lists(v) for k, v in obj.items()}
+
+    # Check if all keys are consecutive integers starting at 0
+    if all(k.isdigit() for k in converted):
+        indices = sorted(int(k) for k in converted)
+        if indices == list(range(len(indices))):
+            return [converted[str(i)] for i in indices]
+
+    return converted
 
 
 def save_mlx_weights(state_dict_path, output_path):
