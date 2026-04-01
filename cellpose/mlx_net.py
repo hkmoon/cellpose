@@ -101,6 +101,27 @@ class Attention(_BaseModule):
         return x
 
 
+def _precompute_rel_pos_for_size(spatial_size, rel_pos):
+    """Interpolate relative position embeddings to match the target spatial size.
+
+    Args:
+        spatial_size: Target spatial dimension (H or W of feature map).
+        rel_pos: Current rel_pos embeddings, shape (L, head_dim).
+
+    Returns:
+        Interpolated rel_pos of shape (2*spatial_size-1, head_dim).
+    """
+    target_len = 2 * spatial_size - 1
+    if rel_pos.shape[0] == target_len:
+        return rel_pos
+    from scipy.interpolate import interp1d
+    rel_pos_np = np.array(rel_pos)
+    x_old = np.linspace(0, 1, rel_pos_np.shape[0])
+    x_new = np.linspace(0, 1, target_len)
+    f = interp1d(x_old, rel_pos_np, axis=0, kind='linear')
+    return mx.array(f(x_new).astype(np.float32))
+
+
 def _get_rel_pos(q_size, k_size, rel_pos):
     """Get relative positional embeddings according to the relative positions of query and key."""
     max_rel_dist = int(2 * max(q_size, k_size) - 1)
@@ -124,7 +145,13 @@ def _get_rel_pos(q_size, k_size, rel_pos):
 
 
 def _add_decomposed_rel_pos(attn, q, rel_pos_h, rel_pos_w, q_size, k_size):
-    """Add decomposed relative positional embeddings to attention."""
+    """Add decomposed relative positional embeddings to attention.
+
+    Mirrors SAM's add_decomposed_rel_pos exactly:
+        rel_h = einsum("bhwc,hkc->bhwk", r_q, Rh)  -> (B, q_h, q_w, k_h)
+        rel_w = einsum("bhwc,wkc->bhwk", r_q, Rw)  -> (B, q_h, q_w, k_w)
+        attn += rel_h[:,:,:,:,None] + rel_w[:,:,:,None,:]
+    """
     q_h, q_w = q_size
     k_h, k_w = k_size
     Rh = _get_rel_pos(q_h, k_h, rel_pos_h)
@@ -132,12 +159,19 @@ def _add_decomposed_rel_pos(attn, q, rel_pos_h, rel_pos_w, q_size, k_size):
 
     B, _, dim = q.shape
     r_q = q.reshape(B, q_h, q_w, dim)
-    # einsum "bhwc,hkc->bhwk"
+
+    # einsum "bhwc,hkc->bhwk": contract over c, index h shared
+    # r_q: (B, q_h, q_w, dim), Rh: (q_h, k_h, dim)
     rel_h = (r_q[:, :, :, None, :] * Rh[None, :, None, :, :]).sum(axis=-1)
-    # einsum "bhwc,wkc->bhwk"
+    # einsum "bhwc,wkc->bhwk": contract over c, index w shared
+    # r_q: (B, q_h, q_w, dim), Rw: (q_w, k_w, dim)
     rel_w = (r_q[:, :, :, None, :] * Rw[None, None, :, :, :]).sum(axis=-1)
 
-    attn = attn.reshape(B, q_h, q_w, k_h, k_w) + rel_h + rel_w
+    # rel_h: (B, q_h, q_w, k_h) -> unsqueeze last dim for broadcasting over k_w
+    # rel_w: (B, q_h, q_w, k_w) -> unsqueeze at -2 for broadcasting over k_h
+    attn = (attn.reshape(B, q_h, q_w, k_h, k_w)
+            + mx.expand_dims(rel_h, axis=-1)
+            + mx.expand_dims(rel_w, axis=-2))
     attn = attn.reshape(B, q_h * q_w, k_h * k_w)
     return attn
 
@@ -333,4 +367,21 @@ class TransformerMLX(_BaseModule):
         from .mlx_utils import convert_pytorch_to_mlx_weights
         mlx_weights = convert_pytorch_to_mlx_weights(state_dict, self)
         self.update(mlx_weights)
+        mx.eval(self.parameters())
+        self._precompute_rel_pos()
+
+    def _precompute_rel_pos(self):
+        """Pre-compute interpolated relative position embeddings.
+
+        The SAM checkpoint stores rel_pos at size (2*64-1, head_dim)=(127, head_dim),
+        but cellpose uses spatial size bsize//ps=32, needing (2*32-1)=(63, head_dim).
+        Pre-computing avoids repeated scipy interpolation during inference.
+        """
+        spatial_size = self.bsize // self.ps
+        for blk in self.blocks:
+            if blk.attn.use_rel_pos:
+                blk.attn.rel_pos_h = _precompute_rel_pos_for_size(
+                    spatial_size, blk.attn.rel_pos_h)
+                blk.attn.rel_pos_w = _precompute_rel_pos_for_size(
+                    spatial_size, blk.attn.rel_pos_w)
         mx.eval(self.parameters())

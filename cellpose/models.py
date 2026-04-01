@@ -108,7 +108,10 @@ class CellposeModel():
             diam_mean (float, optional): Mean "diameter", 30. is built-in value for "cyto" model; 17. is built-in value for "nuclei" model; if saved in custom model file (cellpose>=2.0) then it will be loaded automatically and overwrite this value.
             device (torch device, optional): Device used for model running / training (torch.device("cuda") or torch.device("cpu")), overrides gpu input, recommended if you want to use a specific GPU (e.g. torch.device("cuda:1")).
             use_bfloat16 (bool, optional): Use 16bit float precision instead of 32bit for model weights. Default to 16bit (True).
-            use_mlx (bool, optional): Use MLX backend for Apple Silicon acceleration. Requires macOS with Apple Silicon and MLX installed. Defaults to False.
+            use_mlx (bool or str, optional): Use MLX backend for Apple Silicon acceleration.
+                If True, use MLX backend. If "auto", auto-detect and use MLX on Apple Silicon
+                when CUDA is not available. Requires macOS with Apple Silicon and MLX installed.
+                Defaults to False.
         """
         if diam_mean is not None:
             models_logger.warning(
@@ -121,13 +124,25 @@ class CellposeModel():
         if nchan is not None:
             models_logger.warning("nchan argument is deprecated in v4.0.1+. Ignoring this argument")
 
-        # Check if MLX backend is requested
-        self.use_mlx = use_mlx and MLX_AVAILABLE
-        if use_mlx and not MLX_AVAILABLE:
-            models_logger.warning(
-                "MLX backend requested but MLX is not available. "
-                "Install with: pip install mlx. Falling back to PyTorch."
-            )
+        # Check if MLX backend is requested or auto-detected
+        if use_mlx == "auto":
+            # Auto-detect: use MLX on Apple Silicon when CUDA is not available
+            if MLX_AVAILABLE and not torch.cuda.is_available():
+                self.use_mlx = True
+                models_logger.info(
+                    "MLX auto-detected on Apple Silicon (no CUDA available). "
+                    "Using MLX backend."
+                )
+            else:
+                self.use_mlx = False
+        elif use_mlx:
+            self.use_mlx = MLX_AVAILABLE
+            if not MLX_AVAILABLE:
+                models_logger.warning(
+                    "MLX backend requested but MLX is not available. "
+                    "Install with: pip install mlx. Falling back to PyTorch."
+                )
+        else:
             self.use_mlx = False
 
         if self.use_mlx:
@@ -351,9 +366,10 @@ class CellposeModel():
             if len(flow3D_smooth) == 3 and any(v > 0 for v in flow3D_smooth):
                 models_logger.info(f"smoothing flows with ZYX sigma={flow3D_smooth}")
                 dP = gaussian_filter(dP, [0, *flow3D_smooth])
-            else: 
+            else:
                 models_logger.warning(f"Could not do flow smoothing with {flow3D_smooth} either because its len was not 3 or no items were > 0, skipping flow3D_smoothing")
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             gc.collect()
 
         if compute_masks:
